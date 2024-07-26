@@ -1,0 +1,6 @@
+clothseg/model/
+clothseg/assets/
+*.pyc
+output/
+stn.pytorch/
+tmp/
