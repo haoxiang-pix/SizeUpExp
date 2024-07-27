@@ -171,7 +171,6 @@ class ResnetBlock2D(nn.Module):
         self.conv1 = nn.Conv2d(
             in_channels, out_channels, kernel_size=3, stride=1, padding=1
         )
-        self.time_emb_proj = nn.Linear(1280, out_channels, bias=True)
         self.norm2 = nn.GroupNorm(32, out_channels, eps=1e-05, affine=True)
         self.dropout = nn.Dropout(p=0.0, inplace=False)
         self.conv2 = nn.Conv2d(
@@ -255,29 +254,32 @@ class DownBlock2D(nn.Module):
         return hidden_states, output_states
 
 class UpBlock2D(nn.Module):
-    def __init__(self, in_channels, out_channels, prev_output_channel, has_upsampler=True):
+    def __init__(self, in_channels, out_channels, skip_input_channels, has_upsampler=True):
         super(UpBlock2D, self).__init__()
+        self.skip_input_channels = skip_input_channels
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.resnets = nn.ModuleList(
             [
-                ResnetBlock2D(out_channels + prev_output_channel, out_channels),
-                ResnetBlock2D(out_channels * 2, out_channels),
-                ResnetBlock2D(out_channels + in_channels, out_channels),
+                ResnetBlock2D(in_channels + skip_input_channels[-1], in_channels),
+                ResnetBlock2D(in_channels + skip_input_channels[-2], in_channels),
+                ResnetBlock2D(in_channels + skip_input_channels[-3], out_channels),
             ]
         )
         if has_upsampler:
-            self.upsamplers = nn.ModuleList([Upsample2D(out_channels, out_channels)])
+            self.upsamplers = nn.ModuleList([Upsample2D(in_channels, in_channels)])
         else:
             self.upsamplers = None
 
     def forward(self, hidden_states, res_hidden_states_tuple):
-        for resnet in self.resnets:
-            res_hidden_states = res_hidden_states_tuple[-1]
-            res_hidden_states_tuple = res_hidden_states_tuple[:-1]
-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
-            hidden_states = resnet(hidden_states)
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
                 hidden_states = upsampler(hidden_states)
+        for resnet in self.resnets:
+            res_hidden_states = res_hidden_states_tuple[-1]
+            res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+            hidden_states_c = torch.cat([hidden_states, res_hidden_states], dim=1)
+            hidden_states = resnet(hidden_states_c)
         return hidden_states
 
 
@@ -302,49 +304,73 @@ class FlowUNet2DModel(nn.Module):
 
         # channels = [320, 640, 1280, 320]
         # channels = [128, 256, 512, 128]
-        channels = [32, 64, 128, 32]
+        channels = [32, 64, 128]
 
         self.conv_in = nn.Conv2d(3, channels[0], kernel_size=3, stride=1, padding=1)
         self.down_blocks = nn.ModuleList(
             [
                 DownBlock2D(in_channels=channels[0], out_channels=channels[0]),
                 DownBlock2D(in_channels=channels[0], out_channels=channels[1]),
-                DownBlock2D(in_channels=channels[1], out_channels=channels[2], has_downsample=False),
+                DownBlock2D(in_channels=channels[1], out_channels=channels[2], has_downsample=True),
             ]
         )
         self.up_blocks = nn.ModuleList(
             [
-                UpBlock2D(in_channels=channels[1], out_channels=channels[2], prev_output_channel=channels[2]),
-                UpBlock2D(in_channels=channels[0], out_channels=channels[1], prev_output_channel=channels[2]),
-                UpBlock2D(in_channels=channels[0], out_channels=channels[0], prev_output_channel=channels[1], has_upsampler=False),
+                UpBlock2D(in_channels=channels[2], out_channels=channels[1], skip_input_channels=[channels[1], channels[2], channels[2]]),
+                UpBlock2D(in_channels=channels[1], out_channels=channels[0], skip_input_channels=[channels[0], channels[1], channels[1]]),
+                UpBlock2D(in_channels=channels[0], out_channels=channels[0], skip_input_channels=[channels[0], channels[0], channels[0]], has_upsampler=True),
             ]
         )
         self.mid_block = UNetMidBlock2D(channels[2])
-        self.conv_norm_out = nn.GroupNorm(32, channels[3], eps=1e-05, affine=True)
-        self.conv_act = nn.SiLU()
-        self.conv_out = nn.Conv2d(channels[3], 2, kernel_size=1, stride=1, padding=0)
+        self.flow_pred0 = nn.Sequential(
+            nn.GroupNorm(32, channels[2], eps=1e-05, affine=True),
+            nn.SiLU(),
+            nn.Conv2d(channels[2], 2, kernel_size=1, stride=1, padding=0),
+            nn.Tanh(),
+            nn.Upsample(scale_factor=8, mode='bilinear', align_corners=True)
+        )
+        self.flow_pred1 = nn.Sequential(
+            nn.GroupNorm(32, channels[1], eps=1e-05, affine=True),
+            nn.SiLU(),
+            nn.Conv2d(channels[1], 2, kernel_size=1, stride=1, padding=0),
+            nn.Tanh(),
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=True)
+        )
+        self.flow_pred2 = nn.Sequential(
+            nn.GroupNorm(32, channels[0], eps=1e-05, affine=True),
+            nn.SiLU(),
+            nn.Conv2d(channels[0], 2, kernel_size=1, stride=1, padding=0),
+            nn.Tanh(),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        )
+        self.flow_pred3 = nn.Sequential(
+            nn.GroupNorm(32, channels[0], eps=1e-05, affine=True),
+            nn.SiLU(),
+            nn.Conv2d(channels[0], 2, kernel_size=1, stride=1, padding=0),
+            nn.Tanh()
+        )
 
     def forward(self, sample):
 
         sample = self.conv_in(sample)
 
         # 3. down
-        s0 = sample
-        sample, [s1, s2, s3] = self.down_blocks[0](sample)
-        sample, [s4, s5, s6] = self.down_blocks[1](sample)
-        sample, [s7, s8] = self.down_blocks[2](sample)
+        s0 = sample # 512
+        sample, [s1, s2, s3] = self.down_blocks[0](sample) # wh 512, 512, 256, c 32, 32, 32
+        sample, [s4, s5, s6] = self.down_blocks[1](sample) # wh 256, 256, 128, c 64, 64, 64
+        sample, [s7, s8, s9] = self.down_blocks[2](sample) # wh 128, 128, 64, c 128, 128, 128
 
         # 4. mid
-        sample = self.mid_block(sample)
+        sample = self.mid_block(sample) # wh 64, c 128
 
         # 5. up
-        sample = self.up_blocks[0](hidden_states=sample, res_hidden_states_tuple=[s6, s7, s8])
-        sample = self.up_blocks[1](hidden_states=sample, res_hidden_states_tuple=[s3, s4, s5])
-        sample = self.up_blocks[2](hidden_states=sample, res_hidden_states_tuple=[s0, s1, s2])
+        pred_flow0 = self.flow_pred0(sample) # 8x
+        sample = self.up_blocks[0](hidden_states=sample, res_hidden_states_tuple=[s6, s7, s8]) # wh 128 c 128 -> 64
+        pred_flow1 = self.flow_pred1(sample) # 4x
+        sample = self.up_blocks[1](hidden_states=sample, res_hidden_states_tuple=[s3, s4, s5]) # wh 256 c 64 -> 32
+        pred_flow2 = self.flow_pred2(sample) # 2x
+        sample = self.up_blocks[2](hidden_states=sample, res_hidden_states_tuple=[s0, s1, s2]) # wh 512 c 32 -> 32
+        pred_flow3 = self.flow_pred3(sample) # 1x
 
-        # 6. post-process
-        sample = self.conv_norm_out(sample)
-        sample = self.conv_act(sample)
-        sample = self.conv_out(sample)
-
-        return sample
+        pred = (pred_flow0 + pred_flow1 + pred_flow2 + pred_flow3)/4
+        return pred
