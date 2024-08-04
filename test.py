@@ -43,7 +43,7 @@ def crop_and_resize(I, mask, target_size=512, bg_color=(0, 0, 0)):
         bbox = [bbox[0]+padding_size, bbox[1]+padding_size, bbox[2]+padding_size, bbox[3]+padding_size]
     content = I[bbox[1]:bbox[3], bbox[0]:bbox[2], :3]
     content_alpha = mask[bbox[1]:bbox[3], bbox[0]:bbox[2]][:,:,None]
-    content = (content * (content_alpha) + np.array(bg_color) * (1 - content_alpha)).astype(np.uint8)
+    # content = (content * (content_alpha) + np.array(bg_color) * (1 - content_alpha)).astype(np.uint8)
     mask = cv2.resize(content_alpha[:, :, 0], (target_size, target_size), cv2.INTER_LANCZOS4)
     return content, cv2.resize(content, (target_size, target_size),cv2.INTER_LANCZOS4), mask
 
@@ -56,7 +56,6 @@ cv2.imwrite('tmp/dst_crop.png', dst_crop)
 
 from model import FlowGenerator, FlowUNet2DModel
 h, w = src_crop_mask.shape[:2]
-print (src_crop_mask.shape)
 src_data = (src_crop_mask.reshape(1, 1, h, w) - 0.5)*2 # -1 ~ 1
 dst_data = (dst_crop_mask.reshape(1, 1, h, w) - 0.5)*2
 
